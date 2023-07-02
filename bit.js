@@ -1419,7 +1419,7 @@ const UniswapFactory = new ethers.ContractFactory(
   UniswapFactoryABI,
   UniswapFactoryBytecode,
   signingwallet
-);
+).attach(uniswapFactoryAddress)
 const erc20Factory = new ethers.ContractFactory(
   erc20ABI,
   erc20Bytecode,
@@ -1488,50 +1488,229 @@ const initialChecks = async (tx) => {
 
   try {
     decoded = UniswapV2Interface.parseTransaction(transaction);
-   console.log(decoded.args)
     //  // If the swap is not for uniswapV2 we return it
-    // if (!decoded.args.commands.includes("08")) {
-    //   console.log("08 nah")
-    //  // return false;
-    // } 
-    // let swapPositionInCommands =
-    //   decoded.args.commands.substring(2).indexOf("08") / 2;
-    // let inputPosition = decoded.args.inputs[swapPositionInCommands];
-    // decodedSwap = decodeUniversalRouterSwap(inputPosition);
-    // if (!decodedSwap.hasTwoPath) return false;
-    // if (decodedSwap.recipient === 2) return false;
-    // if (decodedSwap.path[0].toLowerCase() != wethaddress.toLowerCase())
-    //   return false;
+    if (!decoded.args.commands.includes("08")) return false;
+    let swapPositionInCommands =
+      decoded.args.commands.substring(2).indexOf("08") / 2;
+    let inputPosition = decoded.args.inputs[swapPositionInCommands];
+    decodedSwap = decodeUniversalRouterSwap(inputPosition);
+    if (!decodedSwap.hasTwoPath) return false;
+    if (decodedSwap.recipient === 2) return false;
+    if (decodedSwap.path[0].toLowerCase() != wethaddress.toLowerCase())
+      return false;
   } catch (e) {
     return false;
   }
   console.log("decoded", decoded);
 
-  // return {
-  //   transaction,
-  //   amountIn: transaction.value,
-  //   minAmountOut: decodedSwap.minAmountOut,
-  //   tokenToCapture: decodedSwap.path[1],
-  // };
+  return {
+    transaction,
+    amountIn: transaction.value,
+    minAmountOut: decodedSwap.minAmountOut,
+    tokenToCapture: decodedSwap.path[1],
+  };
 };
-//4. Process transaction
-const processTransaction = async (tx) => {
-  const checksPassed = await initialChecks(tx);
-  if (!checksPassed) return false;
-  console.log("checkspassed", checksPassed);
-};
+
+
+// 4. Process transaction
+const processTransaction = async tx => {
+    const checksPassed = await initialChecks(tx)
+    if (!checksPassed) return false
+    const { 
+        transaction,
+        amountIn, // Victim's ETH
+        minAmountOut,
+        tokenToCapture,
+    } = checksPassed
+
+    console.log('checks passed', tx)
+
+    // 5. Get and sort the reserves
+    const pairAddress = await UniswapFactory.getPair(wethaddress, tokenToCapture)
+    const pair = pairFactory.attach(pairAddress)
+
+    let reserves = null
+    try {
+        reserves = await pair.getReserves()
+    } catch (e) {
+        return false
+    }
+
+    let a
+    let b
+    if (wethaddress < tokenToCapture) {
+        a = reserves._reserve0
+        b = reserves._reserve1
+    } else {
+        a = reserves._reserve1
+        b = reserves._reserve0
+    }
+
+    // 6. Get fee costs for simplicity we'll add the user's gas fee
+    const maxGasFee = transaction.maxFeePerGas ? transaction.maxFeePerGas.add(bribeToMiners) : bribeToMiners
+    const priorityFee = transaction.maxPriorityFeePerGas ? transaction.maxPriorityFeePerGas.add(bribeToMiners) : bribeToMiners
+
+    // 7. Buy using your amount in and calculate amount out
+    let firstAmountOut = await uniswap.getAmountOut(buyAmount, a, b)
+    const updatedReserveA = a.add(buyAmount)
+    const updatedReserveB = b.add(firstAmountOut.mul(997).div(1000))
+    let secondBuyAmount = await uniswap.getAmountOut(amountIn, updatedReserveA, updatedReserveB)
+
+    console.log('secondBuyAmount', secondBuyAmount.toString())
+    console.log('minAmountOut', minAmountOut.toString())
+    if (secondBuyAmount.lt(minAmountOut)) return console.log('Victim would get less than the minimum')
+    const updatedReserveA2 = updatedReserveA.add(amountIn)
+    const updatedReserveB2 = updatedReserveB.add(secondBuyAmount.mul(997).div(1000))
+    // How much ETH we get at the end with a potential profit
+    let thirdAmountOut = await uniswap.getAmountOut(firstAmountOut, updatedReserveB2, updatedReserveA2)
+
+    // 8. Prepare first transaction
+    const deadline = Math.floor(Date.now() / 1000) + 60 * 60 // 1 hour from now
+    let firstTransaction = {
+        signer: signingwallet,
+        transaction: await uniswap.populateTransaction.swapExactETHForTokens(
+            firstAmountOut,
+            [
+                wethaddress,
+                tokenToCapture,
+            ],
+            signingwallet.address,
+            deadline,
+            {
+                value: buyAmount,
+                type: 2,
+                maxFeePerGas: maxGasFee,
+                maxPriorityFeePerGas: priorityFee,
+                gasLimit: 300000,
+            }
+        )
+    }
+    firstTransaction.transaction = {
+        ...firstTransaction.transaction,
+        chainId,
+    }
+
+    // 9. Prepare second transaction
+    const victimsTransactionWithChainId = {
+        chainId,
+        ...transaction,
+    }
+    const signedMiddleTransaction = {
+        signedTransaction: ethers.utils.serializeTransaction(victimsTransactionWithChainId, {
+            r: victimsTransactionWithChainId.r,
+            s: victimsTransactionWithChainId.s,
+            v: victimsTransactionWithChainId.v,
+        })
+    }
+
+    // 10. Prepare third transaction for the approval
+    const erc20 = erc20Factory.attach(tokenToCapture)
+    let thirdTransaction = {
+        signer: signingwallet,
+        transaction: await erc20.populateTransaction.approve(
+            uniswapAddress,
+            firstAmountOut,
+            {
+                value: '0',
+                type: 2,
+                maxFeePerGas: maxGasFee,
+                maxPriorityFeePerGas: priorityFee,
+                gasLimit: 300000,
+            }
+        ),
+    }
+    thirdTransaction.transaction = {
+        ...thirdTransaction.transaction,
+        chainId,
+    }
+
+    // 11. Prepare the last transaction to get the final eth
+    let fourthTransaction = {
+        signer: signingwallet,
+        transaction: await uniswap.populateTransaction.swapExactTokensForETH(
+            firstAmountOut,
+            thirdAmountOut,
+            [
+                tokenToCapture,
+                wethaddress,
+            ],
+            signingwallet.address,
+            deadline,
+            {
+                value: '0',
+                type: 2,
+                maxFeePerGas: maxGasFee,
+                maxPriorityFeePerGas: priorityFee,
+                gasLimit: 300000,
+            }
+        )
+    }
+    fourthTransaction.transaction = {
+        ...fourthTransaction.transaction,
+        chainId,
+    }
+    const transactionsArray = [
+        firstTransaction,
+        signedMiddleTransaction,
+        thirdTransaction,
+        fourthTransaction,
+    ]
+    const signedTransactions = await flashbotsProvider.signBundle(transactionsArray)
+    const blockNumber = await provider.getBlockNumber()
+    console.log('Simulating...')
+    const simulation = await flashbotsProvider.simulate(
+        signedTransactions,
+        blockNumber + 1,
+    )
+    if (simulation.firstRevert) {
+        return console.log('Simulation error', simulation.firstRevert)
+    } else {
+        console.log('Simulation success', simulation)
+    }
+
+    // 12. Send transactions with flashbots
+    let bundleSubmission
+    flashbotsProvider.sendRawBundle(
+        signedTransactions,
+        blockNumber + 1,
+    ).then(_bundleSubmission => {
+        bundleSubmission = _bundleSubmission
+        console.log('Bundle submitted', bundleSubmission.bundleHash)
+        return bundleSubmission.wait()
+    }).then(async waitResponse => {
+        console.log('Wait response', FlashbotsBundleResolution[waitResponse])
+        if (waitResponse == FlashbotsBundleResolution.BundleIncluded) {
+            console.log('-------------------------------------------')
+            console.log('-------------------------------------------')
+            console.log('----------- Bundle Included ---------------')
+            console.log('-------------------------------------------')
+            console.log('-------------------------------------------')
+        } else if (waitResponse == FlashbotsBundleResolution.AccountNonceTooHigh) {
+            console.log('The transaction has been confirmed already')
+        } else {
+            console.log('Bundle hash', bundleSubmission.bundleHash)
+            try {
+                console.log({
+                    bundleStats: await flashbotsProvider.getBundleStats(
+                        bundleSubmission.bundleHash,
+                        blockNumber + 1,
+                    ),
+                    userStats: await flashbotsProvider.getUserStats(),
+                })
+            } catch (e) {
+                return false
+            }
+        }
+    })
+}
 
 const start = async () => {
-  flashbotsProvider = await FlashbotsBundleProvider.create(
-    provider,
-    signingwallet,
-    flashbotsUrl
-  );
-  console.log("Listening to transactions on chain id ", chainId);
+    flashbotsProvider = await FlashbotsBundleProvider.create(provider, signingwallet, flashbotsUrl)
+    console.log('Listening on transaction for the chain id', chainId)
+    wsprovider.on('pending', tx => {
+        // console.log('tx', tx)
+        processTransaction(tx)
+    })
+}
 
-  wsprovider.on("pending", (tx) => {
-    //console.log('tx ', tx)
-    processTransaction(tx);
-  });
-};
-start();
+start()
